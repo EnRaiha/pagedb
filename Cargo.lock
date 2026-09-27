@@ -1244,7 +1244,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-bindgen-test",
  "web-sys",
  "windows-sys",
  "zeroize",
@@ -1266,6 +1265,15 @@ dependencies = [
 
 [[package]]
 name = "pagedb-wasm-smoke"
+version = "0.0.0"
+dependencies = [
+ "pagedb",
+ "tokio",
+ "wasm-bindgen-test",
+]
+
+[[package]]
+name = "pagedb-wasm-smoke-no-clock"
 version = "0.0.0"
 dependencies = [
  "pagedb",

@@ -266,7 +266,9 @@ jobs:
   # Runtime wasm coverage. The `wasm` job above only compiles: a wall-clock
   # read inside the txn layer compiles fine on wasm32 and panics at the first
   # commit ("time not implemented on this platform"), which is invisible to a
-  # check. This job runs the smoke crate under node.
+  # check. This job runs both smoke crates under node — the `opfs` build, where
+  # a clock exists, and the crate that builds `pagedb` without `opfs` at all,
+  # where it does not and age retention has to be refused.
   wasm-tests:
     name: WASM / node smoke (wasm32)
     runs-on: ubuntu-latest
@@ -294,6 +296,16 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         run: cargo test -p pagedb-wasm-smoke --target wasm32-unknown-unknown --test commit_smoke
+
+      # Same target, the other configuration: `pagedb-wasm-smoke-no-clock`
+      # depends on `pagedb` without `opfs`, so `clock_available()` is false
+      # there. This is what runs the refusal — which `wasm-smoke` cannot reach,
+      # because its own dependency on `opfs` fixes the feature for every test
+      # target in that build.
+      - name: Run no-clock wasm smoke tests (node)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p pagedb-wasm-smoke-no-clock --target wasm32-unknown-unknown --test refusal
 
   # ─────────────────────────────────────────────────────────────────────────
   features:
