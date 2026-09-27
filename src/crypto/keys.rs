@@ -10,7 +10,7 @@
 //!
 //! Both halves are load bearing. `Zeroizing<T>` derives `Debug` and forwards to
 //! the inner `T`, so a `pub(crate)` field was enough for
-//! `format!("{key.0:?}")` to print all 32 bytes — a wrapper's own `Debug` does
+//! `format!("{:?}", key.0)` to print all 32 bytes — a wrapper's own `Debug` does
 //! not help if callers can reach past it. Keeping the field private removes
 //! that spelling; the manual `Debug` implementations make the ordinary
 //! `{key:?}` spelling inert rather than a compile error someone works around.
