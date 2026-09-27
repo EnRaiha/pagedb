@@ -13,7 +13,9 @@ pagedb versions two things separately.
 
 **A store this build cannot read is refused, never reinterpreted.** pagedb reads exactly one format version. Anything else fails at open with `PagedbError::FormatVersionUnsupported { stored, supported }`, decided from the cleartext version before any key is derived, with the store untouched.
 
-**A refused open is not a damaged store.** A wrong key reports `KeyMismatch`, a wrong page size `PageSizeMismatch`, a wrong realm `RealmMismatch`, and an old format `FormatVersionUnsupported`. Each says the store was not modified, because the reasonable reaction to "your database is corrupt" destroys data that a correct parameter — or a migration — would have opened.
+**An unknown capability is refused, never ignored.** The main header carries a 32-bit `flags` field of capability bits. Each bit names a behavior a writer relies on, and this build understands none of them. If either A/B header slot authenticates and sets a bit this build does not understand, the open fails with `PagedbError::HeaderCapabilityUnsupported { unknown_flags }`, whatever the slot's sequence number. The check runs only after the header MAC verifies, so a flipped bit in an unauthenticated slot stays ordinary corruption and the other slot is used. The store is untouched.
+
+**A refused open is not a damaged store.** A wrong key reports `KeyMismatch`, a wrong page size `PageSizeMismatch`, a wrong realm `RealmMismatch`, an old format `FormatVersionUnsupported`, and an unknown capability `HeaderCapabilityUnsupported`. Each says the store was not modified, because the reasonable reaction to "your database is corrupt" destroys data that a correct parameter — or a migration — would have opened.
 
 ## Migration
 
