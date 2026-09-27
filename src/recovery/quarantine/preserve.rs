@@ -18,6 +18,7 @@
 
 use crate::Result;
 use crate::errors::PagedbError;
+use crate::segment::writer::STAGING_DIR;
 use crate::vfs::Vfs;
 
 /// Where a quarantined store went, and what moved.
@@ -43,13 +44,7 @@ pub struct QuarantineReport {
 /// So the layout this crate writes is enumerated rather than discovered.
 /// Anything a backend does report is still moved; this only ensures the
 /// directories pagedb itself creates are never missed.
-const STORE_SUBDIRS: &[&str] = &[
-    "seg",
-    "seg/.staging",
-    "seg/.tombstone",
-    "applyjournal",
-    "tmp",
-];
+const STORE_SUBDIRS: &[&str] = &["seg", STAGING_DIR, "seg/.tombstone", "applyjournal", "tmp"];
 
 /// Move every file of the store rooted at `store_dir` into
 /// `<store_dir>/quarantine/<label>/`, preserving the store's directory layout

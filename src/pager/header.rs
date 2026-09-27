@@ -5,16 +5,17 @@
 //! `seq` (HK-MAC-verified). A torn write to one slot leaves the other intact.
 
 use crate::Result;
+use crate::crypto::SecretKey;
+use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::crypto::keys::DerivedKey;
-// `decode_main_db_header` and the corruption detail it reports are needed only
-// by `open_header`, which is test-only: production openers decode per slot
-// because the HK has to be derived from each slot's own salt and epoch.
+// `CorruptionDetail` is used only by `open_header`, which is test-only.
+// Production openers authenticate per slot because each slot's HK derives from its own salt and epoch.
 #[cfg(test)]
 use crate::errors::CorruptionDetail;
 use crate::errors::PagedbError;
-#[cfg(test)]
-use crate::pager::format::structural_header::decode_main_db_header;
-use crate::pager::format::structural_header::{MainDbHeaderFields, encode_main_db_header};
+use crate::pager::format::structural_header::{
+    MainDbHeaderFields, decode_main_db_header, encode_main_db_header,
+};
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile, read_exact_at, write_all_at};
 
@@ -107,6 +108,51 @@ pub(crate) async fn read_header_slot<F: VfsFile + ?Sized>(
         }
         other => other,
     }
+}
+
+/// Authenticate one header slot under `hk`.
+///
+/// Returns `None` when the slot fails to verify. A wrong key, a torn write,
+/// and damage look identical.
+///
+/// Returns `Err` only for `HeaderCapabilityUnsupported`. The key already
+/// authenticated the slot, so no other key or slot revokes its capability.
+pub(crate) fn authenticate_slot(
+    slot: &[u8],
+    hk: &DerivedKey,
+    page_size: usize,
+) -> Result<Option<MainDbHeaderFields>> {
+    match decode_main_db_header(slot, hk, page_size) {
+        Ok(fields) => Ok(Some(fields)),
+        Err(error @ PagedbError::HeaderCapabilityUnsupported { .. }) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Authenticate one header slot under `kek`, as [`authenticate_slot`] does.
+///
+/// The HK derives from the KEK salt and MK epoch, stored unencrypted at
+/// bytes `32..48` and `48..56`. Returns the HK with the fields so the
+/// caller can rewrite the slot.
+pub(crate) fn authenticate_slot_with_kek(
+    slot: &[u8],
+    kek: &SecretKey,
+    page_size: usize,
+) -> Result<Option<(MainDbHeaderFields, DerivedKey)>> {
+    if slot.len() < 56 {
+        return Ok(None);
+    }
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&slot[32..48]);
+    let mut epoch = [0u8; 8];
+    epoch.copy_from_slice(&slot[48..56]);
+    let Ok(mk) = derive_mk(kek.as_bytes(), &salt, u64::from_le_bytes(epoch)) else {
+        return Ok(None);
+    };
+    let Ok(hk) = derive_hk(&mk) else {
+        return Ok(None);
+    };
+    Ok(authenticate_slot(slot, &hk, page_size)?.map(|fields| (fields, hk)))
 }
 
 /// Reads both slots; verifies each via HK-MAC; picks the one with the

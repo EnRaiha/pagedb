@@ -1,10 +1,9 @@
-//! Free helper functions shared across DB submodules: page-size encoding, VFS
-//! root extraction, and header peeking.
+//! Free helper functions shared across DB submodules: page-size encoding and
+//! VFS root extraction.
 
 use crate::Result;
-use crate::crypto::kdf::{derive_hk, derive_mk};
 use crate::errors::PagedbError;
-use crate::pager::header::read_header_slot;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::vfs::Vfs;
 
 pub(super) fn page_size_log2(page_size: usize) -> Result<u8> {
@@ -26,67 +25,4 @@ pub(super) fn get_vfs_root<V: Vfs + Clone>(vfs: &V) -> Result<std::path::PathBuf
     vfs.root_path()
         .map(std::path::Path::to_path_buf)
         .ok_or(PagedbError::Unsupported)
-}
-
-/// Read the `restore_mode` byte from the on-disk header of an existing
-/// `main.db` without fully opening the database.
-///
-/// Authenticates both slots and rejects unsupported capabilities before
-/// returning the first understood slot's `restore_mode` under the given KEK.
-pub(super) async fn peek_restore_mode<V: Vfs + Clone>(
-    vfs: &V,
-    kek: &[u8; 32],
-    page_size: usize,
-) -> Result<u8> {
-    use crate::vfs::types::OpenMode;
-
-    let mut f = vfs.open("/main.db", OpenMode::Read).await?;
-    let mut buf_a = vec![0u8; page_size];
-    let mut buf_b = vec![0u8; page_size];
-    read_header_slot(&mut f, 0, &mut buf_a).await?;
-    let page_size_u64 = u64::try_from(page_size)
-        .map_err(|_| PagedbError::Io(std::io::Error::other("page_size > u64")))?;
-    read_header_slot(&mut f, page_size_u64, &mut buf_b).await?;
-    drop(f);
-
-    // Same classification as the full open, for the same reason: this probe
-    // runs *before* it on the read-only modes, so a wrong page size or KEK
-    // would otherwise be reported here as damage and never reach the check
-    // that knows better.
-    super::open::header_probe::check_page_size(&buf_a, &buf_b, page_size)?;
-    super::open::header_probe::check_format_version(&buf_a, &buf_b)?;
-
-    let mut restore_mode = None;
-    for buf in [&buf_a, &buf_b] {
-        if buf.len() < 56 {
-            continue;
-        }
-        let mut kek_salt = [0u8; 16];
-        kek_salt.copy_from_slice(&buf[32..48]);
-        let mut ep_bytes = [0u8; 8];
-        ep_bytes.copy_from_slice(&buf[48..56]);
-        let mk_epoch = u64::from_le_bytes(ep_bytes);
-        let Ok(mk) = derive_mk(kek, &kek_salt, mk_epoch) else {
-            continue;
-        };
-        let Ok(hk) = derive_hk(&mk) else {
-            continue;
-        };
-        match crate::pager::format::structural_header::decode_main_db_header(buf, &hk, page_size) {
-            Ok(fields) => {
-                // Keep the probe's existing first-understood-slot semantics,
-                // but inspect the other slot before returning: an authentic
-                // unknown capability must not disappear in this preflight.
-                restore_mode.get_or_insert(fields.restore_mode);
-            }
-            Err(error @ PagedbError::HeaderCapabilityUnsupported { .. }) => return Err(error),
-            Err(_) => {}
-        }
-    }
-    if let Some(mode) = restore_mode {
-        return Ok(mode);
-    }
-    Err(super::open::header_probe::unverifiable_header_cause(
-        &buf_a, &buf_b, page_size,
-    ))
 }

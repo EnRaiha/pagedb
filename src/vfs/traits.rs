@@ -120,6 +120,18 @@ pub(crate) async fn read_exact_at<F: VfsFile + ?Sized>(
     Ok(())
 }
 
+/// Remove `path`, treating a file that is already gone as removed.
+///
+/// Used for crash-cleanup of scratch files, where absence counts as success.
+/// Only a real backend error returns as `Err`.
+pub(crate) async fn remove_if_present<V: Vfs>(vfs: &V, path: &str) -> Result<()> {
+    match vfs.remove(path).await {
+        Ok(()) => Ok(()),
+        Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Validate one positional read result and advance its offset.
 ///
 /// A backend may legally satisfy a request in several calls, so a short read is

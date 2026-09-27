@@ -10,8 +10,7 @@ use crate::crypto::{CipherId, SecretKey};
 use crate::errors::PagedbError;
 use crate::options::OpenOptions;
 use crate::pager::anchor::HeaderCursor;
-use crate::pager::header::ActiveSlot;
-use crate::pager::header::read_header_slot;
+use crate::pager::header::{ActiveSlot, authenticate_slot_with_kek, read_header_slot};
 use crate::pager::structural_header::MainDbHeaderFields;
 use crate::pager::{Pager, PagerConfig};
 use crate::vfs::Vfs;
@@ -44,7 +43,16 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_existing_inner(vfs, kek, page_size, realm, options, DbMode::Standalone).await
+        Self::open_existing_inner_with_counterpart(
+            vfs,
+            kek,
+            None,
+            page_size,
+            realm,
+            options,
+            DbMode::Standalone,
+        )
+        .await
     }
 
     /// Reopen an existing database: reads and verifies both A/B header slots,
@@ -63,9 +71,10 @@ impl<V: Vfs + Clone> Db<V> {
         realm: RealmId,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_existing_inner(
+        Self::open_existing_inner_with_counterpart(
             vfs,
             kek,
+            None,
             page_size,
             realm,
             OpenOptions::default(),
@@ -76,6 +85,11 @@ impl<V: Vfs + Clone> Db<V> {
 
     /// Explicitly resume an interrupted KEK-changing rekey. `primary_kek` is
     /// the normal caller key; `counterpart_kek` proves the other durable epoch.
+    ///
+    /// The handle is a Standalone writer, opened like [`Db::open`]. It holds
+    /// the writer sentinel and refuses a restored directory. Unlike
+    /// `Db::open`, a missing store reports `NotFound` since no interrupted
+    /// rekey exists to resume.
     pub async fn open_existing_with_counterpart_kek(
         vfs: V,
         primary_kek: impl Into<SecretKey>,
@@ -86,7 +100,7 @@ impl<V: Vfs + Clone> Db<V> {
     ) -> Result<Self> {
         let primary_kek = primary_kek.into();
         let counterpart_kek = counterpart_kek.into();
-        Self::open_existing_inner_with_counterpart(
+        Self::open_with_mode(
             vfs,
             primary_kek,
             Some(counterpart_kek),
@@ -98,20 +112,8 @@ impl<V: Vfs + Clone> Db<V> {
         .await
     }
 
-    pub(super) async fn open_existing_inner(
-        vfs: V,
-        kek: SecretKey,
-        page_size: usize,
-        realm: RealmId,
-        options: OpenOptions,
-        mode: DbMode,
-    ) -> Result<Self> {
-        Self::open_existing_inner_with_counterpart(vfs, kek, None, page_size, realm, options, mode)
-            .await
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn open_existing_inner_with_counterpart(
+    pub(in crate::txn::db) async fn open_existing_inner_with_counterpart(
         vfs: V,
         kek: SecretKey,
         counterpart_kek: Option<SecretKey>,
@@ -145,34 +147,16 @@ impl<V: Vfs + Clone> Db<V> {
         check_format_version(&buf_a, &buf_b)?;
 
         let try_decode = |buf: &[u8]| -> SlotDecode {
-            if buf.len() < 56 {
-                return (None, None);
-            }
-            let mut salt = [0u8; 16];
-            salt.copy_from_slice(&buf[32..48]);
-            let mut epoch_bytes = [0u8; 8];
-            epoch_bytes.copy_from_slice(&buf[48..56]);
-            let epoch = u64::from_le_bytes(epoch_bytes);
             for (candidate, primary) in [(Some(&kek), true), (counterpart_kek.as_ref(), false)] {
                 let Some(candidate) = candidate else {
                     continue;
                 };
-                let Ok(mk) = derive_mk(candidate.as_bytes(), &salt, epoch) else {
-                    continue;
-                };
-                let Ok(hk) = derive_hk(&mk) else {
-                    continue;
-                };
-                match crate::pager::format::structural_header::decode_main_db_header(
-                    buf, &hk, page_size,
-                ) {
-                    Ok(fields) => return (Some((fields, primary)), None),
+                match authenticate_slot_with_kek(buf, candidate, page_size) {
+                    Ok(Some((fields, _))) => return (Some((fields, primary)), None),
+                    Ok(None) => {}
                     // This key authenticated the slot, so trying a counterpart
                     // cannot make its advertised capability disappear.
-                    Err(error @ PagedbError::HeaderCapabilityUnsupported { .. }) => {
-                        return (None, Some(error));
-                    }
-                    Err(_) => {}
+                    Err(error) => return (None, Some(error)),
                 }
             }
             (None, None)
@@ -215,6 +199,16 @@ impl<V: Vfs + Clone> Db<V> {
             });
         }
 
+        // A restored directory shares its source's DEK and nonce space. A
+        // Standalone writer on it repeats the source's nonces. Only
+        // `rekey_into_writer`, which gives the directory a fresh identity,
+        // clears the restore mode.
+        if capabilities.rejects_unpromoted_restore()
+            && fields.restore_mode != super::super::restore_mode::STANDALONE
+        {
+            return Err(PagedbError::RestoredNotPromoted);
+        }
+
         let cipher_id = CipherId::from_byte(fields.cipher_id)?;
         let mk_epoch = fields.mk_epoch;
         let file_id = fields.file_id;
@@ -239,7 +233,14 @@ impl<V: Vfs + Clone> Db<V> {
             main_db_path: main_db_path.clone(),
             anchor_budget: options.anchor_budget,
             dek_lru_capacity: 256,
-            observer_retry_count: options.observer_retry_count,
+            // Retrying a failed read absorbs a torn read from a concurrent
+            // writer. Only an Observer shares the file with a writer. Every
+            // other mode reports the first failure as corruption.
+            observer_retry_count: if capabilities.allows_observer_retry() {
+                options.observer_retry_count
+            } else {
+                0
+            },
             metrics_enabled: options.metrics_enabled,
         };
         let vfs_arc = Arc::new(vfs);

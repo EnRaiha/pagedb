@@ -2,6 +2,7 @@
 //! tombstone GC, spill-scratch reclamation.
 
 pub(crate) mod deep_walk;
+pub(crate) mod fork;
 pub(crate) mod gc;
 pub(crate) mod journal;
 pub(crate) mod provenance;

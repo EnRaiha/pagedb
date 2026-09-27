@@ -11,6 +11,7 @@ use crate::pager::Pager;
 use crate::segment::authenticated_metadata::{
     ExpectedSegmentPath, authenticate_segment_metadata, validate_expected_path,
 };
+use crate::segment::writer::{STAGING_DIR, staging_path};
 use crate::vfs::Vfs;
 use crate::vfs::types::OpenMode;
 use crate::{RealmId, Result};
@@ -181,10 +182,7 @@ async fn authenticate_row<V: Vfs + Clone>(
             Ok((meta.segment_id, None))
         }
         Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            let staging = format!(
-                "seg/.staging/{}",
-                crate::hex::to_hex_lower(&meta.segment_id)
-            );
+            let staging = staging_path(&meta.segment_id);
             let file = match vfs.open(&staging, OpenMode::Read).await {
                 Ok(file) => file,
                 Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -219,7 +217,7 @@ async fn has_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]]) -> Result<bool> {
             return Ok(true);
         }
     }
-    let staging_entries = vfs.list_dir("seg/.staging").await?;
+    let staging_entries = vfs.list_dir(STAGING_DIR).await?;
     for name in staging_entries {
         let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
@@ -248,13 +246,13 @@ async fn sweep_orphans<V: Vfs>(vfs: &V, expected: &[[u8; 16]], recovery_commit: 
             vfs.rename(&from, &to).await?;
         }
     }
-    let staging_entries = vfs.list_dir("seg/.staging").await?;
+    let staging_entries = vfs.list_dir(STAGING_DIR).await?;
     for name in staging_entries {
         let Some(id) = crate::hex::parse_hex::<16>(&name) else {
             continue;
         };
         if !expected_ids.contains(&id) {
-            vfs.remove(&format!("seg/.staging/{name}")).await?;
+            vfs.remove(&format!("{STAGING_DIR}/{name}")).await?;
         }
     }
     vfs.sync_dir("seg").await?;

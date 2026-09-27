@@ -187,7 +187,7 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
         cipher_id: db.cipher_id.as_byte(),
         page_size_log2: page_size_log2(db.page_size)?,
-        flags: 0,
+        flags: db.header_flags,
         file_id: db.file_id,
         kek_salt: db.kek_salt,
         mk_epoch: db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
@@ -202,10 +202,10 @@ pub(super) async fn replace_segment_compact<V: Vfs + Clone>(
         apply_journal_root_version: 0,
         commit_history_root_page_id: 0,
         commit_history_root_version: 0,
-        restore_mode: 0,
+        restore_mode: state.restore_mode,
         next_page_id: new_next,
-        commit_retain_policy_tag: 0,
-        commit_retain_policy_value: 0,
+        commit_retain_policy_tag: state.commit_retain_policy_tag,
+        commit_retain_policy_value: state.commit_retain_policy_value,
         realm_id: db.realm_id,
     };
 
@@ -272,7 +272,6 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
     new_next: u64,
     free_list_root_page_id: u64,
 ) -> MainDbHeaderFields {
-    let _ = state;
     let mut catalog_root_bytes = [0u8; 16];
     catalog_root_bytes[..8].copy_from_slice(&new_cat_root.to_le_bytes());
     catalog_root_bytes[8..].copy_from_slice(&new_commit_id.to_le_bytes());
@@ -280,7 +279,7 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
         format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
         cipher_id: db.cipher_id.as_byte(),
         page_size_log2: page_size_log2(db.page_size).unwrap_or(12),
-        flags: 0,
+        flags: db.header_flags,
         file_id: db.file_id,
         kek_salt: db.kek_salt,
         mk_epoch: db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
@@ -295,10 +294,10 @@ pub(super) fn make_header_fields<V: Vfs + Clone>(
         apply_journal_root_version: 0,
         commit_history_root_page_id: 0,
         commit_history_root_version: 0,
-        restore_mode: 0,
+        restore_mode: state.restore_mode,
         next_page_id: new_next,
-        commit_retain_policy_tag: 0,
-        commit_retain_policy_value: 0,
+        commit_retain_policy_tag: state.commit_retain_policy_tag,
+        commit_retain_policy_value: state.commit_retain_policy_value,
         realm_id: db.realm_id,
     }
 }

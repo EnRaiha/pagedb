@@ -310,7 +310,7 @@ pub async fn replay_apply_journal<V: Vfs + Clone>(
 #[cfg(test)]
 pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction]) -> Result<()> {
     vfs.mkdir_all("seg").await?;
-    vfs.mkdir_all("seg/.staging").await?;
+    vfs.mkdir_all(crate::segment::writer::STAGING_DIR).await?;
     vfs.mkdir_all("seg/.tombstone").await?;
     for action in actions {
         match action {
@@ -338,7 +338,7 @@ pub async fn execute_journal_actions<V: Vfs>(vfs: &V, actions: &[JournalAction])
         }
     }
     vfs.sync_dir("seg").await?;
-    vfs.sync_dir("seg/.staging").await?;
+    vfs.sync_dir(crate::segment::writer::STAGING_DIR).await?;
     vfs.sync_dir("seg/.tombstone").await
 }
 

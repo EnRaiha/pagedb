@@ -3,13 +3,11 @@
 use crate::errors::PagedbError;
 use crate::pager::anchor::HeaderCursor;
 use crate::pager::header::commit_header;
-use crate::pager::structural_header::MainDbHeaderFields;
 use crate::vfs::Vfs;
 use crate::{CommitId, Result};
 
-use super::core::{Db, WriterState, encode_free_list_root, encode_root_ref};
+use super::core::{Db, WriterState};
 use super::segment::SegmentReconciliation;
-use super::util::page_size_log2;
 
 impl<V: Vfs + Clone> Db<V> {
     /// Retry the journal named by the current durable header. The pointer stays
@@ -80,7 +78,7 @@ impl<V: Vfs + Clone> Db<V> {
         let header_cursor = self.pager.header_cursor()?;
         let next_seq = header_cursor.next_seq()?;
         let counter_anchor = self.pager.pending_anchor();
-        let fields = cleared_header_fields(self, state, next_seq, counter_anchor)?;
+        let fields = self.state_header_fields(state, next_seq, counter_anchor)?;
         let hk = self.hk.read().clone();
         let Ok(next_slot) = commit_header(
             &*self.vfs,
@@ -117,37 +115,4 @@ impl<V: Vfs + Clone> Db<V> {
         }
         Ok(())
     }
-}
-
-fn cleared_header_fields<V: Vfs + Clone>(
-    db: &Db<V>,
-    state: &WriterState,
-    seq: u64,
-    counter_anchor: u64,
-) -> Result<MainDbHeaderFields> {
-    Ok(MainDbHeaderFields {
-        format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
-        cipher_id: db.cipher_id.as_byte(),
-        page_size_log2: page_size_log2(db.page_size)?,
-        flags: 0,
-        file_id: db.file_id,
-        kek_salt: db.kek_salt,
-        mk_epoch: db.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
-        seq,
-        active_root_page_id: state.root_page_id,
-        active_root_txn_id: state.latest_commit_id,
-        counter_anchor,
-        commit_id: CommitId(state.latest_commit_id),
-        free_list_root: encode_free_list_root(state.free_list_root_page_id),
-        catalog_root: encode_root_ref(state.catalog_root_page_id, state.catalog_root_txn_id),
-        apply_journal_root_page_id: 0,
-        apply_journal_root_version: 0,
-        commit_history_root_page_id: state.commit_history_root_page_id,
-        commit_history_root_version: state.commit_history_root_version,
-        restore_mode: state.restore_mode,
-        next_page_id: state.next_page_id,
-        commit_retain_policy_tag: state.commit_retain_policy_tag,
-        commit_retain_policy_value: state.commit_retain_policy_value,
-        realm_id: db.realm_id,
-    })
 }

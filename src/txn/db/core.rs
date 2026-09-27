@@ -569,12 +569,56 @@ impl<V: Vfs + Clone> Db<V> {
         }
     }
 
-    /// Assemble a [`MainDbHeaderFields`] for a writer header commit, filling in
-    /// the fields that are constant across every writer commit path (identity,
-    /// format version, and the apply-journal / restore-mode / retain-policy
-    /// fields that are always zero on these paths) from `self`, and taking the
-    /// per-commit variable fields from `params`.
-    pub(super) fn header_fields(&self, params: HeaderFieldsParams) -> Result<MainDbHeaderFields> {
+    /// Header fields that republish `state` as it stands, naming no apply
+    /// journal. A header-only commit writes these: one that changes nothing
+    /// but the header, or one that clears a finished apply journal.
+    ///
+    /// This copies every persisted field from `state` or `self`. The
+    /// rewrite never drops the restore mode, capability flags, or
+    /// retention policy the previous header recorded.
+    pub(super) fn state_header_fields(
+        &self,
+        state: &WriterState,
+        seq: u64,
+        counter_anchor: u64,
+    ) -> Result<MainDbHeaderFields> {
+        Ok(MainDbHeaderFields {
+            format_version: self.format_version,
+            cipher_id: self.cipher_id.as_byte(),
+            page_size_log2: super::util::page_size_log2(self.page_size)?,
+            flags: self.header_flags,
+            file_id: self.file_id,
+            kek_salt: self.kek_salt,
+            mk_epoch: self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            seq,
+            active_root_page_id: state.root_page_id,
+            active_root_txn_id: state.latest_commit_id,
+            counter_anchor,
+            commit_id: CommitId(state.latest_commit_id),
+            free_list_root: encode_free_list_root(state.free_list_root_page_id),
+            catalog_root: encode_root_ref(state.catalog_root_page_id, state.catalog_root_txn_id),
+            apply_journal_root_page_id: 0,
+            apply_journal_root_version: 0,
+            commit_history_root_page_id: state.commit_history_root_page_id,
+            commit_history_root_version: state.commit_history_root_version,
+            restore_mode: state.restore_mode,
+            next_page_id: state.next_page_id,
+            commit_retain_policy_tag: state.commit_retain_policy_tag,
+            commit_retain_policy_value: state.commit_retain_policy_value,
+            realm_id: self.realm_id,
+        })
+    }
+
+    /// Assemble a [`MainDbHeaderFields`] for a writer header commit.
+    /// Identity and format come from `self`. Restore mode and retention
+    /// policy come from `state`, as the previous header recorded them.
+    /// Per-commit fields come from `params`. These paths name no apply
+    /// journal.
+    pub(super) fn header_fields(
+        &self,
+        state: &WriterState,
+        params: HeaderFieldsParams,
+    ) -> Result<MainDbHeaderFields> {
         Ok(MainDbHeaderFields {
             format_version: self.format_version,
             cipher_id: self.cipher_id.as_byte(),
@@ -594,10 +638,10 @@ impl<V: Vfs + Clone> Db<V> {
             apply_journal_root_version: 0,
             commit_history_root_page_id: params.commit_history_root_page_id,
             commit_history_root_version: params.commit_history_root_version,
-            restore_mode: 0,
+            restore_mode: state.restore_mode,
             next_page_id: params.next_page_id,
-            commit_retain_policy_tag: 0,
-            commit_retain_policy_value: 0,
+            commit_retain_policy_tag: state.commit_retain_policy_tag,
+            commit_retain_policy_value: state.commit_retain_policy_value,
             realm_id: self.realm_id,
         })
     }

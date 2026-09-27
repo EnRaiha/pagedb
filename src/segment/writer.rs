@@ -43,6 +43,8 @@ pub struct SegmentWriter<V: Vfs + Clone> {
     /// Exact footer layout copied during rekey. Its index pages have already
     /// been authenticated and appended as logical segment pages.
     rekey_footer_layout: Option<(u64, u32)>,
+    /// Directory the file is written in until something publishes it.
+    dir: &'static str,
 }
 
 impl<V: Vfs + Clone> SegmentWriter<V> {
@@ -52,6 +54,25 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         segment_id: [u8; 16],
         parent_file_id: [u8; 16],
         segment_kind: SegmentKind,
+    ) -> Result<Self> {
+        Self::create_in(
+            pager,
+            realm_id,
+            segment_id,
+            parent_file_id,
+            segment_kind,
+            STAGING_DIR,
+        )
+        .await
+    }
+
+    async fn create_in(
+        pager: Arc<Pager<V>>,
+        realm_id: RealmId,
+        segment_id: [u8; 16],
+        parent_file_id: [u8; 16],
+        segment_kind: SegmentKind,
+        dir: &'static str,
     ) -> Result<Self> {
         let page_size = pager.page_size();
         let cipher_id = pager.cipher_id().as_byte();
@@ -63,10 +84,10 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         // Ensure the staging directory exists and its entry is durable before
         // creating the staging file, so the file's inode survives a power loss
         // before seal is called.
-        pager.vfs().mkdir_all("seg/.staging").await?;
-        pager.vfs().sync_dir("seg/.staging").await?;
+        pager.vfs().mkdir_all(dir).await?;
+        pager.vfs().sync_dir(dir).await?;
 
-        let path = staging_path(&segment_id);
+        let path = format!("{dir}/{}", crate::hex::to_hex_lower(&segment_id));
         let mut file = pager.vfs().open(&path, OpenMode::CreateNew).await?;
 
         let header_fields = SegmentHeaderFields {
@@ -103,6 +124,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             extents: Vec::new(),
             evictable: Evictable::Authoritative,
             rekey_footer_layout: None,
+            dir,
         })
     }
 
@@ -115,16 +137,61 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
         index_start_page: u64,
         index_page_count: u32,
     ) -> Result<Self> {
-        let mut writer = Self::create_internal(
+        Self::create_replica_in(
+            pager,
+            source,
+            segment_id,
+            source.parent_file_id,
+            (index_start_page, index_page_count),
+            STAGING_DIR,
+        )
+        .await
+    }
+
+    /// Construct a `rekey_into_writer` copy of `source` under the fork's `parent_file_id`.
+    /// Preserves layout like a rekey replacement.
+    ///
+    /// The file is written in [`FORK_DIR`], which the open-time orphan scan skips.
+    /// A fork that never publishes leaves the restored directory openable.
+    /// A Standalone open adopts the files once the fork's `main.db` is live.
+    pub(crate) async fn create_fork_internal(
+        pager: Arc<Pager<V>>,
+        source: &SegmentMeta,
+        segment_id: [u8; 16],
+        parent_file_id: [u8; 16],
+        index_start_page: u64,
+        index_page_count: u32,
+    ) -> Result<Self> {
+        Self::create_replica_in(
+            pager,
+            source,
+            segment_id,
+            parent_file_id,
+            (index_start_page, index_page_count),
+            FORK_DIR,
+        )
+        .await
+    }
+
+    async fn create_replica_in(
+        pager: Arc<Pager<V>>,
+        source: &SegmentMeta,
+        segment_id: [u8; 16],
+        parent_file_id: [u8; 16],
+        footer_layout: (u64, u32),
+        dir: &'static str,
+    ) -> Result<Self> {
+        let mut writer = Self::create_in(
             pager,
             source.realm_id,
             segment_id,
-            source.parent_file_id,
+            parent_file_id,
             source.segment_kind,
+            dir,
         )
         .await?;
         writer.evictable = source.evictable;
-        writer.rekey_footer_layout = Some((index_start_page, index_page_count));
+        writer.rekey_footer_layout = Some(footer_layout);
         Ok(writer)
     }
 
@@ -343,7 +410,7 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
             .ok_or_else(|| PagedbError::Io(std::io::Error::other("offset overflow")))?;
         write_all_at(&mut self.file, offset, &footer_bytes).await?;
         self.file.sync().await?;
-        self.pager.vfs().sync_dir("seg/.staging").await?;
+        self.pager.vfs().sync_dir(self.dir).await?;
 
         Ok(SegmentMeta {
             segment_id: self.segment_id,
@@ -372,8 +439,15 @@ impl<V: Vfs + Clone> SegmentWriter<V> {
     }
 }
 
+/// Directory a fresh segment is written in until its commit publishes it.
+pub(crate) const STAGING_DIR: &str = "seg/.staging";
+
+/// Directory `rekey_into_writer` writes its segments in before its `main.db`
+/// is live.
+pub(crate) const FORK_DIR: &str = "seg/.fork";
+
 pub(crate) fn staging_path(segment_id: &[u8; 16]) -> String {
-    format!("seg/.staging/{}", crate::hex::to_hex_lower(segment_id))
+    format!("{STAGING_DIR}/{}", crate::hex::to_hex_lower(segment_id))
 }
 
 pub(crate) fn live_path(segment_id: &[u8; 16]) -> String {

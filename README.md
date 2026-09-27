@@ -185,6 +185,11 @@ defend against, stated plainly so nobody has to infer it.
   capability bit this build does not understand reports
   `HeaderCapabilityUnsupported`: a newer build wrote the store, and it is
   untouched. Open it with a build that understands the capability.
+- **A restored directory is not a writer.** A snapshot directory, and a
+  directory `restore_from` fills, shares the source's key and nonce space. A
+  Standalone open of one reports `RestoredNotPromoted`. Open it with
+  `open_read_only`, track the source with `open_follower`, or call
+  `rekey_into_writer` to fork an independent writer under a fresh identity.
 - **`main.db` is not reconstructible from `seg/`.** Segment files are
   identity-keyed and the mapping from embedder name to segment id lives only in
   the catalog inside `main.db`. Losing `main.db` while `seg/` survives is
