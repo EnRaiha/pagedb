@@ -1,23 +1,17 @@
 //! `IocpVfs`: Windows IOCP-backed VFS rooted at a directory. Advisory path
-//! locking uses an in-process state machine backed by `LockFileEx` for
-//! cross-process exclusion — same protocol as the Tokio fallback. Segment
+//! locking is the shared `oslock` implementation. Segment
 //! files open with `FILE_SHARE_DELETE` so tombstone-rename protocols succeed
 //! against held handles.
 //!
 //! Path operations have no overlapped form: `CreateFile`, `MoveFileEx`,
 //! directory enumeration and friends all park the calling thread. They run on
-//! the blocking pool; only path validation and the in-process lock table stay
-//! on the executor.
-#![allow(unsafe_code)]
+//! the blocking pool.
 
-use std::collections::BTreeMap;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use parking_lot::Mutex;
 
 use crate::Result;
 use crate::errors::PagedbError;
@@ -25,126 +19,14 @@ use crate::errors::PagedbError;
 use super::file::IocpFile;
 use super::port::Port;
 use crate::vfs::blocking::offload;
+use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
-use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, GetLastError, HANDLE,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_OVERLAPPED, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    UnlockFileEx,
-};
-use windows_sys::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
-// ---------------------------------------------------------------------------
-// In-process lock state machine
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-enum LockState {
-    Free,
-    Exclusive,
-    Shared(u32),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LockKind {
-    Exclusive,
-    Shared,
-}
-
-struct InProcLockEntry {
-    state: Mutex<LockState>,
-}
-
-// ---------------------------------------------------------------------------
-// Cross-process lock via LockFileEx
-// ---------------------------------------------------------------------------
-
-struct OsLockFileExHandle {
-    file: std::fs::File,
-}
-
-impl OsLockFileExHandle {
-    fn try_acquire(path: &std::path::Path, kind: LockKind) -> Result<Self> {
-        // FILE_SHARE_READ | FILE_SHARE_WRITE: multiple processes must be able
-        // to open the sentinel file and contend on the lock.
-        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
-
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .share_mode(FILE_SHARE_READ_WRITE)
-            .open(path)
-            .map_err(PagedbError::Io)?;
-
-        let handle = file.as_raw_handle() as HANDLE;
-        let flags = match kind {
-            LockKind::Exclusive => LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            LockKind::Shared => LOCKFILE_FAIL_IMMEDIATELY,
-        };
-
-        // SAFETY: `handle` is valid for the duration of this call (owned by
-        // `file` which is alive). Zero-initialised OVERLAPPED is the
-        // documented input for synchronous `LockFileEx` use. We lock the
-        // whole [0, u64::MAX) byte range.
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        let rc = unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
-
-        if rc == 0 {
-            // SAFETY: documented pattern.
-            let err = unsafe { GetLastError() };
-            if err == ERROR_LOCK_VIOLATION || err == ERROR_IO_PENDING {
-                return Err(PagedbError::AlreadyLocked);
-            }
-            return Err(PagedbError::Io(std::io::Error::last_os_error()));
-        }
-
-        Ok(Self { file })
-    }
-}
-
-impl Drop for OsLockFileExHandle {
-    fn drop(&mut self) {
-        let handle = self.file.as_raw_handle() as HANDLE;
-        // SAFETY: `handle` valid until `file` drops at end of this method.
-        // Errors are ignored in Drop; closing the handle releases the lock
-        // regardless.
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        let _ = unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped) };
-    }
-}
-
-// SAFETY: HANDLE is process-owned and not aliased between threads — the
-// struct moves as a whole.
-unsafe impl Send for OsLockFileExHandle {}
-
-// ---------------------------------------------------------------------------
-// Public lock handle
-// ---------------------------------------------------------------------------
-
-pub struct IocpLockHandle {
-    lock_ref: Arc<InProcLockEntry>,
-    kind: LockKind,
-    _os_lock: OsLockFileExHandle,
-}
-
-impl Drop for IocpLockHandle {
-    fn drop(&mut self) {
-        let mut s = self.lock_ref.state.lock();
-        match (self.kind, *s) {
-            (LockKind::Exclusive, LockState::Exclusive)
-            | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-            (LockKind::Shared, LockState::Shared(n)) if n > 1 => {
-                *s = LockState::Shared(n - 1);
-            }
-            _ => {}
-        }
-    }
-}
+pub use crate::vfs::oslock::NativeLockHandle as IocpLockHandle;
 
 // ---------------------------------------------------------------------------
 // IocpVfs
@@ -157,7 +39,6 @@ struct IocpInner {
     /// means keys are not strictly required to disambiguate completions, but
     /// they are useful for diagnostics and future relaxation of serialisation.
     next_key: AtomicUsize,
-    locks: Mutex<BTreeMap<String, Arc<InProcLockEntry>>>,
 }
 
 #[derive(Clone)]
@@ -173,7 +54,6 @@ impl IocpVfs {
                 root: root.into(),
                 port,
                 next_key: AtomicUsize::new(1),
-                locks: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -182,59 +62,9 @@ impl IocpVfs {
         resolve_native_path(&self.inner.root, path)
     }
 
-    fn lookup_or_create_entry(&self, path: &str) -> Arc<InProcLockEntry> {
-        let mut locks = self.inner.locks.lock();
-        locks
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                Arc::new(InProcLockEntry {
-                    state: Mutex::new(LockState::Free),
-                })
-            })
-            .clone()
-    }
-
     async fn do_lock(&self, path: &str, kind: LockKind) -> Result<IocpLockHandle> {
-        let logical_path = canonical_native_path(path)?;
-        let entry = self.lookup_or_create_entry(&logical_path);
-        {
-            let mut s = entry.state.lock();
-            match (kind, *s) {
-                (LockKind::Exclusive, LockState::Free) => *s = LockState::Exclusive,
-                (LockKind::Shared, LockState::Free) => *s = LockState::Shared(1),
-                (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n + 1),
-                _ => return Err(PagedbError::AlreadyLocked),
-            }
-        }
-        let lock_path = self.resolve(&logical_path)?;
-        // Creating the sentinel file and taking the OS lock are both blocking
-        // syscalls. `LockFileEx` itself is `LOCKFILE_FAIL_IMMEDIATELY`, so it
-        // never waits on a conflict — but opening the file can still stall on
-        // the filesystem, so the pair goes to the pool together.
-        let acquired = offload(move || {
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            OsLockFileExHandle::try_acquire(&lock_path, kind)
-        })
-        .await;
-        match acquired {
-            Ok(os_lock) => Ok(IocpLockHandle {
-                lock_ref: entry,
-                kind,
-                _os_lock: os_lock,
-            }),
-            Err(e) => {
-                let mut s = entry.state.lock();
-                match (kind, *s) {
-                    (LockKind::Exclusive, LockState::Exclusive)
-                    | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-                    (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n - 1),
-                    _ => {}
-                }
-                Err(e)
-            }
-        }
+        let lock_path = self.resolve(&canonical_native_path(path)?)?;
+        crate::vfs::oslock::acquire(lock_path, kind).await
     }
 }
 

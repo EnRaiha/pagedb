@@ -13,7 +13,7 @@ use crate::Result;
 use crate::errors::PagedbError;
 
 use super::blocking::offload;
-use super::oslock::{LockKind, LockTable};
+use super::oslock::LockKind;
 use super::traits::{Vfs, VfsFile, canonical_native_path, resolve_native_path};
 use super::types::{OpenMode, ReadReq, WriteReq};
 
@@ -28,7 +28,7 @@ pub use super::oslock::NativeLockHandle as TokioLockHandle;
 
 /// VFS rooted at a directory. Paths supplied to all methods are resolved
 /// relative to this root; a leading `/` is stripped. Cloning shares the same
-/// root and lock table.
+/// root. Locks are process-wide, so instances over one directory contend.
 #[derive(Clone)]
 pub struct TokioVfs {
     inner: Arc<TokioInner>,
@@ -36,7 +36,6 @@ pub struct TokioVfs {
 
 struct TokioInner {
     root: PathBuf,
-    locks: LockTable,
 }
 
 impl TokioVfs {
@@ -44,10 +43,7 @@ impl TokioVfs {
     /// exist or be created before the first `open` call.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(TokioInner {
-                root: root.into(),
-                locks: LockTable::new(),
-            }),
+            inner: Arc::new(TokioInner { root: root.into() }),
         }
     }
 
@@ -68,7 +64,7 @@ impl TokioVfs {
     async fn do_lock(&self, path: &str, kind: LockKind) -> Result<TokioLockHandle> {
         let logical_path = Self::canonical_logical_path(path)?;
         let lock_path = self.resolve(&logical_path)?;
-        super::oslock::acquire(&self.inner.locks, &logical_path, lock_path, kind).await
+        super::oslock::acquire(lock_path, kind).await
     }
 }
 

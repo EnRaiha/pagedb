@@ -17,7 +17,7 @@ use crate::errors::PagedbError;
 use super::file::IouringFile;
 use super::ring::Ring;
 use crate::vfs::blocking::offload;
-use crate::vfs::oslock::{LockKind, LockTable};
+use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
@@ -33,12 +33,11 @@ pub use crate::vfs::oslock::NativeLockHandle as IouringLockHandle;
 struct IouringInner {
     root: PathBuf,
     ring: Ring,
-    locks: LockTable,
 }
 
 /// VFS rooted at a directory, using `io_uring` for file I/O and `std::fs` /
-/// libc syscalls for path-level operations. Cloning shares the same root,
-/// ring, and lock table.
+/// libc syscalls for path-level operations. Cloning shares the same root and
+/// ring. Locks are process-wide, so instances over one directory contend.
 #[derive(Clone)]
 pub struct IouringVfs {
     inner: Arc<IouringInner>,
@@ -54,7 +53,6 @@ impl IouringVfs {
             inner: Arc::new(IouringInner {
                 root: root.into(),
                 ring,
-                locks: LockTable::new(),
             }),
         })
     }
@@ -66,7 +64,7 @@ impl IouringVfs {
     async fn do_lock(&self, path: &str, kind: LockKind) -> Result<IouringLockHandle> {
         let logical_path = canonical_native_path(path)?;
         let lock_path = self.resolve(&logical_path)?;
-        crate::vfs::oslock::acquire(&self.inner.locks, &logical_path, lock_path, kind).await
+        crate::vfs::oslock::acquire(lock_path, kind).await
     }
 }
 
