@@ -181,7 +181,10 @@ defend against, stated plainly so nobody has to infer it.
   `PagedbError::KeyMismatch`, a wrong page size reports `PageSizeMismatch`, and
   a wrong realm reports `RealmMismatch` — all of them before anything is read or
   written, and none of them is evidence of corruption. Retry with the right
-  parameter; do not discard the directory.
+  parameter; do not discard the directory. An authenticated header that sets a
+  capability bit this build does not understand reports
+  `HeaderCapabilityUnsupported`: a newer build wrote the store, and it is
+  untouched. Open it with a build that understands the capability.
 - **`main.db` is not reconstructible from `seg/`.** Segment files are
   identity-keyed and the mapping from embedder name to segment id lives only in
   the catalog inside `main.db`. Losing `main.db` while `seg/` survives is
