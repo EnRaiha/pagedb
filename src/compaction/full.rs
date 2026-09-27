@@ -11,7 +11,7 @@ use crate::catalog::codec::{Catalog, CatalogRowKind, SegmentMeta};
 use crate::errors::PagedbError;
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentPageKind;
-use crate::segment::writer::SegmentWriter;
+use crate::segment::writer::{STAGING_DIR, SegmentWriter};
 use crate::txn::db::{Db, WriterState};
 use crate::vfs::{Vfs, VfsFile};
 
@@ -149,7 +149,7 @@ async fn repack_one_segment<V: Vfs + Clone>(
         mmap_limit,
     )
     .await?;
-    db.vfs.mkdir_all("seg/.staging").await?;
+    db.vfs.mkdir_all(STAGING_DIR).await?;
     let new_segment_id = crate::crypto::random::segment_id()?;
     let mut writer = SegmentWriter::create_internal(
         db.pager.clone(),

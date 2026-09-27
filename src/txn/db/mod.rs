@@ -24,6 +24,7 @@ mod reader;
 #[cfg(not(target_arch = "wasm32"))]
 mod reclaim;
 pub(crate) mod rekey;
+mod restore_mode;
 mod segment;
 #[cfg(not(target_arch = "wasm32"))]
 mod snapshot;

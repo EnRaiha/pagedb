@@ -1,19 +1,11 @@
 //! `GcdVfs`: macOS / iOS / iPadOS VFS rooted at a directory, using Grand
 //! Central Dispatch I/O for per-file reads and writes. Advisory path locking
-//! uses the same in-process state machine + POSIX `flock` protocol as the
-//! Tokio fallback.
+//! is the shared `oslock` implementation.
 //!
 //! `dispatch_io` covers reads and writes only. Path operations and directory
-//! sync are plain blocking syscalls, so they run on the blocking pool; only
-//! path validation and the in-process lock table stay on the executor.
-#![allow(unsafe_code)]
-
-use std::collections::BTreeMap;
-use std::os::unix::io::AsRawFd;
+//! sync are plain blocking syscalls, so they run on the blocking pool.
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchRetained, GlobalQueueIdentifier};
 
@@ -22,96 +14,15 @@ use crate::errors::PagedbError;
 
 use super::file::GcdFile;
 use crate::vfs::blocking::offload;
+use crate::vfs::oslock::LockKind;
 use crate::vfs::traits::{Vfs, canonical_native_path, resolve_native_path};
 use crate::vfs::types::OpenMode;
 
-#[derive(Debug, Clone, Copy)]
-enum LockState {
-    Free,
-    Exclusive,
-    Shared(u32),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LockKind {
-    Exclusive,
-    Shared,
-}
-
-struct InProcLockEntry {
-    state: Mutex<LockState>,
-}
-
-struct OsFcntlHandle {
-    _file: std::fs::File,
-}
-
-impl OsFcntlHandle {
-    fn try_acquire(path: &std::path::Path, kind: LockKind) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(PagedbError::Io)?;
-
-        let fd = file.as_raw_fd();
-        #[allow(clippy::cast_possible_truncation)]
-        let l_type = match kind {
-            LockKind::Exclusive => libc::F_WRLCK as libc::c_short,
-            LockKind::Shared => libc::F_RDLCK as libc::c_short,
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let flock = libc::flock {
-            l_type,
-            l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: 0,
-            l_len: 0,
-            l_pid: 0,
-        };
-        // SAFETY: `fd` valid (owned by `file`); `flock` fully initialised;
-        // F_SETLK is non-blocking.
-        let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &flock) };
-        if rc == -1 {
-            let err = std::io::Error::last_os_error();
-            let raw = err.raw_os_error().unwrap_or(0);
-            if raw == libc::EAGAIN || raw == libc::EACCES {
-                return Err(PagedbError::AlreadyLocked);
-            }
-            return Err(PagedbError::Io(err));
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-// SAFETY: fd is owned exclusively; struct moves whole-cloth.
-unsafe impl Send for OsFcntlHandle {}
-
-pub struct GcdLockHandle {
-    lock_ref: Arc<InProcLockEntry>,
-    kind: LockKind,
-    _os_lock: OsFcntlHandle,
-}
-
-impl Drop for GcdLockHandle {
-    fn drop(&mut self) {
-        let mut s = self.lock_ref.state.lock();
-        match (self.kind, *s) {
-            (LockKind::Exclusive, LockState::Exclusive)
-            | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-            (LockKind::Shared, LockState::Shared(n)) if n > 1 => {
-                *s = LockState::Shared(n - 1);
-            }
-            _ => {}
-        }
-    }
-}
+pub use crate::vfs::oslock::NativeLockHandle as GcdLockHandle;
 
 struct GcdInner {
     root: PathBuf,
     queue: DispatchRetained<DispatchQueue>,
-    locks: Mutex<BTreeMap<String, Arc<InProcLockEntry>>>,
 }
 
 #[derive(Clone)]
@@ -128,7 +39,6 @@ impl GcdVfs {
             inner: Arc::new(GcdInner {
                 root: root.into(),
                 queue,
-                locks: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -137,57 +47,9 @@ impl GcdVfs {
         resolve_native_path(&self.inner.root, path)
     }
 
-    fn lookup_or_create_entry(&self, path: &str) -> Arc<InProcLockEntry> {
-        let mut locks = self.inner.locks.lock();
-        locks
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                Arc::new(InProcLockEntry {
-                    state: Mutex::new(LockState::Free),
-                })
-            })
-            .clone()
-    }
-
     async fn do_lock(&self, path: &str, kind: LockKind) -> Result<GcdLockHandle> {
-        let logical_path = canonical_native_path(path)?;
-        let entry = self.lookup_or_create_entry(&logical_path);
-        {
-            let mut s = entry.state.lock();
-            match (kind, *s) {
-                (LockKind::Exclusive, LockState::Free) => *s = LockState::Exclusive,
-                (LockKind::Shared, LockState::Free) => *s = LockState::Shared(1),
-                (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n + 1),
-                _ => return Err(PagedbError::AlreadyLocked),
-            }
-        }
-        let lock_path = self.resolve(&logical_path)?;
-        // `F_SETLK` never waits on a conflict, but creating the sentinel file
-        // can still stall on the filesystem, so the pair goes to the pool.
-        let acquired = offload(move || {
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            OsFcntlHandle::try_acquire(&lock_path, kind)
-        })
-        .await;
-        match acquired {
-            Ok(os_lock) => Ok(GcdLockHandle {
-                lock_ref: entry,
-                kind,
-                _os_lock: os_lock,
-            }),
-            Err(e) => {
-                let mut s = entry.state.lock();
-                match (kind, *s) {
-                    (LockKind::Exclusive, LockState::Exclusive)
-                    | (LockKind::Shared, LockState::Shared(1)) => *s = LockState::Free,
-                    (LockKind::Shared, LockState::Shared(n)) => *s = LockState::Shared(n - 1),
-                    _ => {}
-                }
-                Err(e)
-            }
-        }
+        let lock_path = self.resolve(&canonical_native_path(path)?)?;
+        crate::vfs::oslock::acquire(lock_path, kind).await
     }
 }
 

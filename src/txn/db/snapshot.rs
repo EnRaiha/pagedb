@@ -13,6 +13,7 @@ use crate::pager::structural_header::MainDbHeaderFields;
 use crate::recovery::journal::{
     ApplyJournalRecord, JournalAction, encode_journal_id, encode_journal_pages,
 };
+use crate::segment::writer::STAGING_DIR;
 use crate::snapshot::apply::{
     clone_base_image, discard_staged_image, plan_delta_stream, stage_snapshot_segments,
     staged_image_path, validate_snapshot_segment_count, write_delta_into_image,
@@ -369,16 +370,31 @@ impl<V: Vfs + Clone> Db<V> {
         let published_snapshot = *self.snapshot.read();
         let required_page_ids = collect_published_page_ids(self, published_snapshot).await?;
         let highest_required_main_page = required_page_ids.iter().next_back().copied().unwrap_or(1);
-        let stats = match snapshot_full(
-            &src_root,
-            dst_path,
-            &manifest,
-            &hk_raw,
-            &segment_ids,
-            highest_required_main_page,
-        )
-        .await
-        {
+        let exported = async {
+            let stats = snapshot_full(
+                &src_root,
+                dst_path,
+                &manifest,
+                &hk_raw,
+                &segment_ids,
+                highest_required_main_page,
+            )
+            .await?;
+            // The exported `main.db` shares this store's nonce space. Stamping
+            // it keeps a `Db::open` of the snapshot directory from taking
+            // independent writes under this store's key.
+            let hk = self.hk.read().clone();
+            super::restore_mode::stamp_read_only(
+                &TokioVfs::new(dst_path),
+                "/main.db",
+                self.page_size,
+                super::restore_mode::HeaderKey::Hk(&hk),
+            )
+            .await?;
+            Ok::<_, crate::errors::PagedbError>(stats)
+        }
+        .await;
+        let stats = match exported {
             Ok(stats) => stats,
             Err(error) => {
                 cleanup_failed_snapshot(dst_path, ownership).await;
@@ -478,6 +494,16 @@ impl<V: Vfs + Clone> Db<V> {
                 .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("page_size"))?;
             let realm_id = crate::RealmId(manifest.realm_id);
             let dst_vfs = TokioVfs::new(dst_path);
+            // The copy shares the source's nonce space, so it must never open
+            // as a Standalone writer. The stamp precedes the first open, so no
+            // handle ever sees the copy without it.
+            super::restore_mode::stamp_read_only(
+                &dst_vfs,
+                "/main.db",
+                page_size,
+                super::restore_mode::HeaderKey::Kek(&kek),
+            )
+            .await?;
             let restored =
                 Db::<TokioVfs>::open_read_only(dst_vfs, kek, page_size, realm_id, options).await?;
             validate_restored_snapshot(&manifest, &restored).await?;
@@ -838,7 +864,7 @@ impl<V: Vfs + Clone> Db<V> {
             stage_snapshot_segments(src_path, &dst_seg_root, &expected_promoted_segment_ids)
                 .await?;
         if !staged_ids.is_empty() {
-            self.vfs.sync_dir("seg/.staging").await?;
+            self.vfs.sync_dir(STAGING_DIR).await?;
         }
         let segments_promoted = u32::try_from(staged_ids.len())
             .map_err(|_| crate::errors::PagedbError::snapshot_incompatible("segments_count"))?;
@@ -994,7 +1020,7 @@ impl<V: Vfs + Clone> Db<V> {
             format_version: crate::pager::structural_header::MAIN_FORMAT_VERSION,
             cipher_id: self.cipher_id.as_byte(),
             page_size_log2: page_size_log2(self.page_size)?,
-            flags: 0,
+            flags: self.header_flags,
             file_id: self.file_id,
             kek_salt: self.kek_salt,
             mk_epoch: self.mk_epoch.load(std::sync::atomic::Ordering::SeqCst),

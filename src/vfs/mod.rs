@@ -62,7 +62,7 @@ pub use opfs::OpfsVfs;
 pub use oslock::NativeLockHandle;
 pub use traits::{Vfs, VfsFile};
 pub(crate) use traits::{
-    checked_read_progress, read_exact_at, read_exact_at_borrowed, write_all_at,
+    checked_read_progress, read_exact_at, read_exact_at_borrowed, remove_if_present, write_all_at,
 };
 pub use types::{OpenMode, ReadReq, WriteReq};
 pub use wasi::WasiVfs;

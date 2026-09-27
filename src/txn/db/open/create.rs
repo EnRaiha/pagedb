@@ -233,7 +233,34 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
         cipher_id: CipherId,
     ) -> Result<Self> {
-        let main_db_path = "/main.db".to_string();
+        Self::bootstrap_unlocked_at(
+            vfs,
+            &kek,
+            page_size,
+            realm,
+            options,
+            cipher_id,
+            "/main.db".to_string(),
+        )
+        .await
+    }
+
+    /// Bootstrap a fresh store with a new random identity whose main file is
+    /// `main_db_path`. `rekey_into_writer` builds its replacement `main.db`
+    /// this way, at a scratch path. It later renames the scratch file over
+    /// the live file.
+    ///
+    /// Callers must hold the writer sentinel, since this writes the initial
+    /// header unconditionally.
+    pub(in crate::txn::db) async fn bootstrap_unlocked_at(
+        vfs: V,
+        kek: &SecretKey,
+        page_size: usize,
+        realm: RealmId,
+        options: OpenOptions,
+        cipher_id: CipherId,
+        main_db_path: String,
+    ) -> Result<Self> {
         let (file_id, kek_salt) = crate::crypto::random::database_identity()?;
         let mk_epoch = 0u64;
 

@@ -3311,7 +3311,9 @@ async fn failed_apply_promote_poisoned_handle_reopens_and_replays_journal_before
 
     vfs.fail_renames(false);
     drop(follower);
-    let reopened = Db::open_existing(vfs, KEK, PAGE, REALM).await.unwrap();
+    let reopened = Db::open_follower(vfs, KEK, PAGE, REALM, OpenOptions::default())
+        .await
+        .unwrap();
     let segment = reopened.open_segment(REALM, "promoted").await.unwrap();
     assert!(
         segment

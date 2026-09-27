@@ -11,7 +11,6 @@ use super::super::super::mode::{
     ACQUISITION_LOCK_PATH, DbMode, FROZEN_READERS_LOCK_PATH, OBSERVERS_LOCK_PATH, WRITER_LOCK_PATH,
 };
 use super::super::core::Db;
-use super::super::util::peek_restore_mode;
 
 #[derive(Clone, Copy)]
 pub(super) enum PersistentAccess {
@@ -98,6 +97,19 @@ impl DbModeCapabilities {
     #[must_use]
     pub(crate) const fn promotes_to_follower(self) -> bool {
         matches!(self.long_lived_lock, LongLivedLock::FrozenReader)
+    }
+
+    /// This capability lets the handle fork into an independent Standalone
+    /// writer under a fresh identity. The fork replaces `main.db`, so it
+    /// takes the writer sentinel with no other frozen reader present. Only a
+    /// handle holding the frozen-reader or writer sentinel on a
+    /// non-Standalone store can make that trade.
+    #[must_use]
+    pub(crate) const fn forks_into_writer(self) -> bool {
+        matches!(
+            self.long_lived_lock,
+            LongLivedLock::FrozenReader | LongLivedLock::Writer
+        ) && !matches!(self.recovery_authority, RecoveryAuthority::Standalone)
     }
 
     #[must_use]
@@ -196,8 +208,16 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        let db =
-            Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Standalone).await?;
+        let db = Self::open_with_mode(
+            vfs,
+            kek,
+            None,
+            page_size,
+            realm,
+            options,
+            DbMode::Standalone,
+        )
+        .await?;
         // Black box: mark the epoch boundary — freed-page use-after-free
         // surfaces on reopen, so the trail needs to know when one happened.
         crate::diag::reopened(db.latest_commit().0);
@@ -213,7 +233,7 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::ReadOnly).await
+        Self::open_with_mode(vfs, kek, None, page_size, realm, options, DbMode::ReadOnly).await
     }
 
     /// Open a best-effort read-only view of a database that may have a writer.
@@ -225,46 +245,41 @@ impl<V: Vfs + Clone> Db<V> {
         options: OpenOptions,
     ) -> Result<Self> {
         let kek = kek.into();
-        Self::open_with_mode(vfs, kek, page_size, realm, options, DbMode::Observer).await
+        Self::open_with_mode(vfs, kek, None, page_size, realm, options, DbMode::Observer).await
     }
 
-    async fn open_with_mode(
+    /// The one path every public open takes. It applies the mode's sentinel,
+    /// the missing-store rule, and bootstrap under the acquisition lock. It
+    /// then hands off to the shared existing-store opener, which applies the
+    /// rest.
+    ///
+    /// `counterpart_kek` resumes an interrupted KEK-changing rekey. Such an
+    /// open never bootstraps: with no store there is no rekey to resume.
+    pub(super) async fn open_with_mode(
         vfs: V,
         kek: SecretKey,
+        counterpart_kek: Option<SecretKey>,
         page_size: usize,
         realm: RealmId,
         options: OpenOptions,
         mode: DbMode,
     ) -> Result<Self> {
         let capabilities = mode.open_capabilities();
-        let options = if capabilities.allows_observer_retry() {
-            options
-        } else {
-            OpenOptions {
-                observer_retry_count: 0,
-                ..options
-            }
-        };
+        let bootstraps = capabilities.bootstraps() && counterpart_kek.is_none();
         let mut locks = Vec::new();
 
-        // A missing database is a terminal read-only error. Probe before
-        // acquiring a lock because native lock backends materialize sentinel
-        // files when locking an otherwise empty directory.
-        if !capabilities.bootstraps() && !main_db_exists(&vfs).await? {
+        // A missing database is a terminal error unless the open bootstraps.
+        // Probe before acquiring a lock: native lock backends materialize
+        // sentinel files when locking an empty directory.
+        if !bootstraps && !main_db_exists(&vfs).await? {
             return Err(PagedbError::NotFound);
         }
 
         let acquisition = vfs.lock_exclusive(ACQUISITION_LOCK_PATH).await?;
         let main_db_exists = {
             let exists = main_db_exists(&vfs).await?;
-            if !exists && !capabilities.bootstraps() {
+            if !exists && !bootstraps {
                 return Err(PagedbError::NotFound);
-            }
-            if exists
-                && capabilities.rejects_unpromoted_restore()
-                && peek_restore_mode(&vfs, kek.as_bytes(), page_size).await? == 2
-            {
-                return Err(PagedbError::RestoredNotPromoted);
             }
             acquire_interlocking_mode_lock(&vfs, capabilities, &mut locks).await?;
             let lock_path = match capabilities.long_lived_lock() {
@@ -278,7 +293,16 @@ impl<V: Vfs + Clone> Db<V> {
         };
 
         let mut db = if main_db_exists {
-            Self::open_existing_inner(vfs, kek, page_size, realm, options, mode).await?
+            Self::open_existing_inner_with_counterpart(
+                vfs,
+                kek,
+                counterpart_kek,
+                page_size,
+                realm,
+                options,
+                mode,
+            )
+            .await?
         } else {
             // The caller already holds the writer sentinel acquired above, so
             // bootstrap through the lock-free inner path rather than
@@ -296,51 +320,6 @@ impl<V: Vfs + Clone> Db<V> {
         // different sentinel kind and never write.
         db.lock_required = capabilities.allows_user_writes();
         Ok(db)
-    }
-
-    /// Promote a frozen read-only handle to Follower mode after excluding all
-    /// other frozen readers and acquiring the writer sentinel.
-    pub async fn promote_to_follower(mut self) -> Result<Self> {
-        self.ensure_usable()?;
-        self.require_mode(
-            "promote_to_follower",
-            DbMode::ReadOnly,
-            DbModeCapabilities::promotes_to_follower,
-        )?;
-        let acquisition = self.vfs.lock_exclusive(ACQUISITION_LOCK_PATH).await?;
-        self.sentinel_locks.clear();
-        let frozen_probe = self
-            .vfs
-            .lock_exclusive(FROZEN_READERS_LOCK_PATH)
-            .await
-            .map_err(|error| {
-                map_lock_contention(error, || {
-                    crate::diag::lock_rejected(
-                        "follower",
-                        FROZEN_READERS_LOCK_PATH,
-                        "readers_present",
-                    );
-                    PagedbError::ReadersPresent
-                })
-            })?;
-        drop(frozen_probe);
-        let writer_lock = self
-            .vfs
-            .lock_exclusive(WRITER_LOCK_PATH)
-            .await
-            .map_err(|error| {
-                map_lock_contention(error, || {
-                    crate::diag::lock_rejected("follower", WRITER_LOCK_PATH, "already_open");
-                    PagedbError::AlreadyOpen
-                })
-            })?;
-        drop(acquisition);
-        crate::diag::lock_acquired("follower", WRITER_LOCK_PATH);
-        self.pager.enable_write_access().await;
-        self.sentinel_locks.push(writer_lock);
-        self.lock_required = true;
-        self.mode = DbMode::Follower;
-        Ok(self)
     }
 }
 
@@ -444,7 +423,7 @@ async fn acquire_long_lived_lock<V: Vfs>(
     Ok(())
 }
 
-fn map_lock_contention(
+pub(super) fn map_lock_contention(
     error: PagedbError,
     on_contention: impl FnOnce() -> PagedbError,
 ) -> PagedbError {

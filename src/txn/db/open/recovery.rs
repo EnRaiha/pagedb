@@ -5,7 +5,7 @@ use crate::crypto::SecretKey;
 use crate::errors::PagedbError;
 use crate::pager::freelist;
 use crate::pager::structural_header::MainDbHeaderFields;
-use crate::vfs::Vfs;
+use crate::vfs::{Vfs, remove_if_present};
 
 use super::super::core::Db;
 
@@ -28,11 +28,17 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     }
 
     if capabilities.runs_standalone_recovery() {
-        match db.vfs.remove(&format!("{}.compact", db.main_db_path)).await {
-            Ok(()) => {}
-            Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        // Compaction and `rekey_into_writer` each build a replacement
+        // `main.db` beside the live one and publish it by rename. A scratch
+        // still present at open is one whose rename never happened.
+        for suffix in [".compact", ".fork"] {
+            remove_if_present(&*db.vfs, &format!("{}{suffix}", db.main_db_path)).await?;
         }
+
+        // A fork's segments wait outside the orphan scan until its `main.db`
+        // is live. This open has write authority over that `main.db`, so it
+        // hands them to the catalog repair below.
+        crate::recovery::fork::adopt_forked_segments(&*db.vfs).await?;
 
         // Write-transaction spill scratch is keyed to the handle that wrote it,
         // so anything still present belongs to a handle that is gone and is
@@ -73,11 +79,7 @@ pub(super) async fn recover_open_state<V: Vfs + Clone>(
     {
         if capabilities.applies_interrupted_apply() {
             let staged = crate::snapshot::apply::staged_image_path(&db.main_db_path);
-            match db.vfs.remove(&staged).await {
-                Ok(()) => {}
-                Err(PagedbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            remove_if_present(&*db.vfs, &staged).await?;
         }
     }
 

@@ -1,5 +1,6 @@
 //! Online rekey implementation split by durable concern.
 
+mod fork;
 pub(crate) mod intent;
 pub(crate) mod keyring;
 pub(crate) mod main;

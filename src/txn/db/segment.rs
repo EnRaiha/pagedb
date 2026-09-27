@@ -6,7 +6,7 @@ use crate::catalog::codec::CatalogRowKind;
 use crate::catalog::codec::{Catalog, SegmentKind, SegmentMeta};
 use crate::errors::{CorruptionDetail, PagedbError};
 use crate::segment::reader::SegmentReader;
-use crate::segment::writer::SegmentWriter;
+use crate::segment::writer::{STAGING_DIR, SegmentWriter};
 use crate::txn::write::SegmentSideEffect;
 use crate::vfs::types::OpenMode;
 use crate::vfs::{Vfs, VfsFile};
@@ -46,7 +46,7 @@ impl<V: Vfs + Clone> Db<V> {
             DbMode::Standalone,
             DbModeCapabilities::allows_user_writes,
         )?;
-        self.vfs.mkdir_all("seg/.staging").await?;
+        self.vfs.mkdir_all(STAGING_DIR).await?;
         let segment_id = crate::crypto::random::segment_id()?;
         SegmentWriter::create_internal(self.pager.clone(), realm, segment_id, self.file_id, kind)
             .await
@@ -202,10 +202,10 @@ impl<V: Vfs + Clone> Db<V> {
             return Ok(SegmentReconciliation::Complete);
         }
         self.vfs.mkdir_all("seg").await?;
-        self.vfs.mkdir_all("seg/.staging").await?;
+        self.vfs.mkdir_all(STAGING_DIR).await?;
         self.vfs.mkdir_all("seg/.tombstone").await?;
         self.vfs.sync_dir("seg").await?;
-        self.vfs.sync_dir("seg/.staging").await?;
+        self.vfs.sync_dir(STAGING_DIR).await?;
         self.vfs.sync_dir("seg/.tombstone").await?;
 
         // Drain part of the deferred queue as a side effect of this commit, so a
@@ -231,7 +231,7 @@ impl<V: Vfs + Clone> Db<V> {
         }
 
         self.vfs.sync_dir("seg").await?;
-        self.vfs.sync_dir("seg/.staging").await?;
+        self.vfs.sync_dir(STAGING_DIR).await?;
         self.vfs.sync_dir("seg/.tombstone").await?;
         Ok(if deferred {
             SegmentReconciliation::Deferred

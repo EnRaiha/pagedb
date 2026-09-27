@@ -45,19 +45,22 @@ impl<V: Vfs + Clone> Db<V> {
         let counter_anchor = self.pager.pending_anchor();
         let catalog_root_bytes = encode_root_ref(new_catalog_root, new_catalog_txn_id);
 
-        let fields = self.header_fields(HeaderFieldsParams {
-            mk_epoch: self.mk_epoch.load(Ordering::SeqCst),
-            seq: new_seq,
-            active_root_page_id: state.root_page_id,
-            active_root_txn_id: state.latest_commit_id,
-            counter_anchor,
-            commit_id: state.latest_commit_id,
-            catalog_root: catalog_root_bytes,
-            commit_history_root_page_id: state.commit_history_root_page_id,
-            commit_history_root_version: state.commit_history_root_version,
-            free_list_root_page_id: state.free_list_root_page_id,
-            next_page_id: new_next,
-        })?;
+        let fields = self.header_fields(
+            &state,
+            HeaderFieldsParams {
+                mk_epoch: self.mk_epoch.load(Ordering::SeqCst),
+                seq: new_seq,
+                active_root_page_id: state.root_page_id,
+                active_root_txn_id: state.latest_commit_id,
+                counter_anchor,
+                commit_id: state.latest_commit_id,
+                catalog_root: catalog_root_bytes,
+                commit_history_root_page_id: state.commit_history_root_page_id,
+                commit_history_root_version: state.commit_history_root_version,
+                free_list_root_page_id: state.free_list_root_page_id,
+                next_page_id: new_next,
+            },
+        )?;
         let hk_clone = { self.hk.read().clone() };
         let new_slot = commit_header(
             &*self.vfs,

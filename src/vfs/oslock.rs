@@ -1,10 +1,16 @@
 //! Advisory path locking shared by every filesystem-backed native VFS.
 //!
-//! One protocol, one implementation. A lock is two layers: an in-process state
-//! machine that gives fast single-process exclusion, and an OS-level lock that
+//! One protocol, one implementation. A lock is two layers: a process-wide
+//! table that excludes every handle in this process, and an OS-level lock that
 //! excludes other processes — `fcntl` OFD locks (`F_OFD_SETLK`) on Linux,
 //! classic `F_SETLK` on other Unix, and `LockFileEx` on Windows. On targets
 //! with neither, only the in-process layer applies.
+//!
+//! The table is keyed by resolved lock-file path, so all VFS instances share
+//! it. macOS `F_SETLK` never conflicts within one process. This table enforces
+//! the conflict instead.
+//! Each entry owns the process's single OS lock on its file. One descriptor
+//! means an early close can never drop an `F_SETLK` lock.
 //!
 //! Both layers live here rather than in each backend deliberately. The store's
 //! single-writer guarantee rests on the `.writer.lock` sentinel, and two
@@ -48,64 +54,82 @@ pub(crate) enum LockKind {
     Shared,
 }
 
+/// One lock domain: its holders in this process and the OS lock they share.
+struct EntryState {
+    mode: LockState,
+    #[cfg(any(unix, windows))]
+    os: Option<OsLock>,
+}
+
 struct InProcLockEntry {
-    state: Mutex<LockState>,
+    /// Serializes taking the OS lock for a free domain.
+    gate: tokio::sync::Mutex<()>,
+    state: Mutex<EntryState>,
 }
 
 impl InProcLockEntry {
-    /// Take the in-process layer, or report the conflict without touching it.
-    fn try_enter(&self, kind: LockKind) -> Result<()> {
-        let mut state = self.state.lock();
-        match (kind, *state) {
-            (LockKind::Exclusive, LockState::Free) => *state = LockState::Exclusive,
-            (LockKind::Shared, LockState::Free) => *state = LockState::Shared(1),
-            (LockKind::Shared, LockState::Shared(n)) => *state = LockState::Shared(n + 1),
-            _ => return Err(PagedbError::AlreadyLocked),
+    fn new() -> Self {
+        Self {
+            gate: tokio::sync::Mutex::new(()),
+            state: Mutex::new(EntryState {
+                mode: LockState::Free,
+                #[cfg(any(unix, windows))]
+                os: None,
+            }),
         }
-        Ok(())
     }
 
-    /// Give the in-process layer back. Used both when a handle drops and to
-    /// roll back after the OS layer refused, so a failed acquisition leaves no
-    /// trace.
+    /// Join a held domain. `false` means it is free and needs the OS lock.
+    fn try_join(&self, kind: LockKind) -> Result<bool> {
+        let mut state = self.state.lock();
+        match (kind, state.mode) {
+            (_, LockState::Free) => Ok(false),
+            (LockKind::Shared, LockState::Shared(n)) => {
+                state.mode = LockState::Shared(n + 1);
+                Ok(true)
+            }
+            _ => Err(PagedbError::AlreadyLocked),
+        }
+    }
+
+    /// Record the first holder of a free domain.
+    fn install(&self, kind: LockKind, #[cfg(any(unix, windows))] os: OsLock) {
+        let mut state = self.state.lock();
+        state.mode = match kind {
+            LockKind::Exclusive => LockState::Exclusive,
+            LockKind::Shared => LockState::Shared(1),
+        };
+        #[cfg(any(unix, windows))]
+        {
+            state.os = Some(os);
+        }
+    }
+
+    /// Give one hold back. The last holder releases the OS lock.
     fn leave(&self, kind: LockKind) {
         let mut state = self.state.lock();
-        match (kind, *state) {
-            (LockKind::Exclusive, LockState::Exclusive)
-            | (LockKind::Shared, LockState::Shared(1)) => *state = LockState::Free,
-            (LockKind::Shared, LockState::Shared(n)) if n > 1 => *state = LockState::Shared(n - 1),
-            _ => {}
+        state.mode = match (kind, state.mode) {
+            (LockKind::Shared, LockState::Shared(n)) if n > 1 => LockState::Shared(n - 1),
+            _ => LockState::Free,
+        };
+        #[cfg(any(unix, windows))]
+        if matches!(state.mode, LockState::Free) {
+            state.os = None;
         }
     }
 }
 
-/// Per-VFS table of in-process lock entries, keyed by canonical logical path.
-///
-/// Each distinct canonical path is its own lock domain. The table only ever
-/// grows an entry per path that has been locked at least once; entries are
-/// cheap and keeping them avoids racing a concurrent acquirer against removal.
-pub(crate) struct LockTable {
-    entries: Mutex<BTreeMap<String, Arc<InProcLockEntry>>>,
-}
+/// Every lock domain in the process, keyed by resolved lock-file path.
+/// Entries are never removed, so no acquirer races a removal.
+static LOCK_TABLE: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, Arc<InProcLockEntry>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-impl LockTable {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    fn entry(&self, path: &str) -> Arc<InProcLockEntry> {
-        let mut entries = self.entries.lock();
-        entries
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                Arc::new(InProcLockEntry {
-                    state: Mutex::new(LockState::Free),
-                })
-            })
-            .clone()
-    }
+fn entry(key: PathBuf) -> Arc<InProcLockEntry> {
+    LOCK_TABLE
+        .lock()
+        .entry(key)
+        .or_insert_with(|| Arc::new(InProcLockEntry::new()))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -307,119 +331,142 @@ type OsLock = OsLockFileExHandle;
 // Public lock handle.
 // ---------------------------------------------------------------------------
 
-/// RAII advisory lock handle returned by every native backend's
-/// `lock_exclusive` / `lock_shared`. Holds the in-process state guard and, on
-/// targets that have one, the OS-level lock. Dropping it releases both.
+/// Advisory lock returned by every native backend's `lock_exclusive` and
+/// `lock_shared`. The last holder of a file releases the OS lock on drop.
 pub struct NativeLockHandle {
     entry: Arc<InProcLockEntry>,
     kind: LockKind,
-    /// On Unix: holds the fcntl-locked file open (an OFD lock on Linux, a
-    /// process `F_SETLK` lock elsewhere). On Windows: holds the
-    /// `LockFileEx`-locked file open. Dropped together with this handle.
-    #[cfg(any(unix, windows))]
-    _os_lock: OsLock,
 }
 
 impl Drop for NativeLockHandle {
     fn drop(&mut self) {
         self.entry.leave(self.kind);
-        // `_os_lock` is dropped automatically after this, releasing the OS lock.
     }
 }
 
-/// Acquire an advisory lock on one canonical logical path.
-///
-/// `logical_path` names the lock domain in the in-process table;
-/// `lock_path` is the sentinel file on disk that carries the OS-level lock.
-pub(crate) async fn acquire(
-    table: &LockTable,
-    logical_path: &str,
-    lock_path: PathBuf,
-    kind: LockKind,
-) -> Result<NativeLockHandle> {
-    let entry = table.entry(logical_path);
-    // In-process guard first: fast fail if this process already holds a
-    // conflicting lock on the path, without touching the filesystem.
-    entry.try_enter(kind)?;
-
+/// Acquire an advisory lock on the sentinel file at `lock_path`, creating the
+/// file and its directory when absent.
+pub(crate) async fn acquire(lock_path: PathBuf, kind: LockKind) -> Result<NativeLockHandle> {
     #[cfg(any(unix, windows))]
     {
-        // Neither `*_SETLK` nor `LOCKFILE_FAIL_IMMEDIATELY` waits on a
-        // conflict, but creating the sentinel file can still stall on the
-        // filesystem, so the pair goes to the blocking pool together.
-        let acquired = offload(move || {
-            if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
-            }
-            OsLock::try_acquire(&lock_path, kind)
-        })
-        .await;
-        match acquired {
-            Ok(os_lock) => Ok(NativeLockHandle {
-                entry,
-                kind,
-                _os_lock: os_lock,
-            }),
-            Err(error) => {
-                // The OS layer refused, so the in-process layer must not stay
-                // taken — a rejected acquisition leaves no trace.
-                entry.leave(kind);
-                Err(error)
+        // Filesystem calls, so off the async thread.
+        let key = offload(move || resolve_lock_key(&lock_path)).await?;
+        let entry = entry(key.clone());
+        {
+            let _gate = entry.gate.lock().await;
+            if !entry.try_join(kind)? {
+                // Creating the sentinel file can stall on the filesystem.
+                let os = offload(move || OsLock::try_acquire(&key, kind)).await?;
+                entry.install(kind, os);
             }
         }
+        Ok(NativeLockHandle { entry, kind })
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = lock_path;
+        let entry = entry(lock_path);
+        {
+            let _gate = entry.gate.lock().await;
+            if !entry.try_join(kind)? {
+                entry.install(kind);
+            }
+        }
         Ok(NativeLockHandle { entry, kind })
     }
+}
+
+/// Canonical directory plus file name, so two spellings of one path match.
+#[cfg(any(unix, windows))]
+fn resolve_lock_key(lock_path: &std::path::Path) -> Result<PathBuf> {
+    let parent = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(PagedbError::Io)?;
+    let parent = std::fs::canonicalize(parent).map_err(PagedbError::Io)?;
+    let name = lock_path.file_name().ok_or_else(|| {
+        PagedbError::Io(std::io::Error::other(format!(
+            "lock path has no file name: {}",
+            lock_path.display()
+        )))
+    })?;
+    Ok(parent.join(name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_exclusive_entry_excludes_every_other_kind() {
-        let table = LockTable::new();
-        let entry = table.entry("/db");
-        entry.try_enter(LockKind::Exclusive).unwrap();
+    fn lock_file(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_exclusive_lock_excludes_every_other_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive)
+            .await
+            .unwrap();
         assert!(matches!(
-            entry.try_enter(LockKind::Exclusive),
+            acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive).await,
             Err(PagedbError::AlreadyLocked)
         ));
         assert!(matches!(
-            entry.try_enter(LockKind::Shared),
+            acquire(lock_file(&dir, "a.lock"), LockKind::Shared).await,
             Err(PagedbError::AlreadyLocked)
         ));
     }
 
-    #[test]
-    fn shared_entries_stack_and_only_the_last_release_frees_the_domain() {
-        let table = LockTable::new();
-        let entry = table.entry("/db");
-        entry.try_enter(LockKind::Shared).unwrap();
-        entry.try_enter(LockKind::Shared).unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_holds_stack_and_only_the_last_release_frees_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire(lock_file(&dir, "a.lock"), LockKind::Shared)
+            .await
+            .unwrap();
+        let second = acquire(lock_file(&dir, "a.lock"), LockKind::Shared)
+            .await
+            .unwrap();
 
-        entry.leave(LockKind::Shared);
+        drop(first);
         assert!(
             matches!(
-                entry.try_enter(LockKind::Exclusive),
+                acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive).await,
                 Err(PagedbError::AlreadyLocked)
             ),
             "one shared holder remains, so exclusive must still be refused"
         );
 
-        entry.leave(LockKind::Shared);
-        entry.try_enter(LockKind::Exclusive).unwrap();
+        drop(second);
+        acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive)
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn the_same_logical_path_always_maps_to_one_entry() {
-        let table = LockTable::new();
-        let first = table.entry("/db");
-        let second = table.entry("/db");
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!Arc::ptr_eq(&first, &table.entry("/other")));
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_spellings_of_one_lock_file_share_one_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive)
+            .await
+            .unwrap();
+        let respelled = dir.path().join("sub").join("..").join("a.lock");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert!(
+            matches!(
+                acquire(respelled, LockKind::Exclusive).await,
+                Err(PagedbError::AlreadyLocked)
+            ),
+            "a second spelling of the path must not bypass the holder"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn distinct_lock_files_are_distinct_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let _a = acquire(lock_file(&dir, "a.lock"), LockKind::Exclusive)
+            .await
+            .unwrap();
+        acquire(lock_file(&dir, "b.lock"), LockKind::Exclusive)
+            .await
+            .unwrap();
     }
 }
