@@ -114,6 +114,9 @@ web-sys = { version = "0.3", optional = true, features = [
 [target.'cfg(any(target_os = "linux", all(target_os = "android", not(target_arch = "arm"))))'.dependencies]
 io-uring = "0.7"
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1.1"
+
 [features]
 default = ["diagnostics"]
 # Emit black-box reports (corruption, read-verify failures) and operation
@@ -132,7 +135,7 @@ opfs = [
     "dep:futures",
 ]
 
-[dev-dependencies]
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
@@ -148,6 +151,10 @@ fluxbench = "0.1"
 # it is proptest and not a nightly-only libFuzzer harness. Dev-only: it must
 # never reach the published surface or the default feature set.
 proptest = "1.11"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [[bin]]
 name = "pagedb-fsck"
