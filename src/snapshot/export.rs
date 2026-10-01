@@ -14,6 +14,7 @@ use crate::Result;
 use crate::errors::PagedbError;
 
 use super::SnapshotStats;
+use super::copy_extent::copy_file_extent;
 
 // ---------------------------------------------------------------------------
 // Manifest layout constants
@@ -195,18 +196,15 @@ async fn copy_file_to(src_path: &Path, dst_path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Perform a full snapshot of `src_db_root` (a `TokioVfs` root directory) to
-/// `dst_path`. Returns the manifest and stats for use by `Db::snapshot_to`.
-///
-/// This function is called while a non-abortable `ReadTxn` pin is held in the
-/// caller; that pin ensures the catalog and segment files remain live.
-pub async fn snapshot_full(
+/// Full export using the main.db extent captured by the owning database.
+pub(crate) async fn snapshot_full(
     src_db_root: &Path,
     dst_path: &Path,
     manifest: &SnapshotManifest,
     hk_key: &[u8; 32],
     segment_ids: &[[u8; 16]],
     highest_required_main_page: u64,
+    main_db_extent: u64,
 ) -> Result<SnapshotStats> {
     ensure_empty_destination(dst_path).await?;
 
@@ -235,7 +233,7 @@ pub async fn snapshot_full(
     // Copy main.db.
     let main_src = src_db_root.join("main.db");
     let main_dst = dst_path.join("main.db");
-    let main_bytes = copy_file_to(&main_src, &main_dst).await?;
+    let main_bytes = copy_file_extent(&main_src, &main_dst, main_db_extent).await?;
     total_bytes += main_bytes;
 
     // Count pages from file size.
