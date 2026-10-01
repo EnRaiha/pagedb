@@ -8,4 +8,5 @@ mod generated_nodes;
 mod generated_overflow_chains;
 mod generated_structural_walks;
 mod overflow_walk_offset;
+mod scan_bounded;
 mod tree_ops;

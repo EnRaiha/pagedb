@@ -51,7 +51,8 @@ pub use segment::{
 };
 pub use snapshot::{ApplyStats, SnapshotStats};
 pub use txn::{
-    CounterRef, Db, DbMode, ReadTxn, ReaderStallPolicy, ScratchOffset, SpillScope, WriteTxn,
+    CounterRef, Db, DbMode, ReadTxn, ReaderStallPolicy, ScanBatch, ScanLimit, ScratchOffset,
+    SpillScope, WriteTxn,
 };
 
 /// Opaque cryptographic isolation scope identifier.

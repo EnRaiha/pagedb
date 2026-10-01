@@ -11,5 +11,5 @@ pub(crate) mod write;
 pub use db::Db;
 pub use mode::DbMode;
 pub use policy::ReaderStallPolicy;
-pub use read::ReadTxn;
+pub use read::{ReadTxn, ScanBatch, ScanLimit};
 pub use write::{CounterRef, ScratchOffset, SpillScope, WriteTxn};

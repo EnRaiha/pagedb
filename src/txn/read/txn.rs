@@ -9,7 +9,7 @@ use crate::pager::PageGuard;
 use crate::segment::reader::SegmentReader;
 use crate::txn::db::Db;
 use crate::vfs::Vfs;
-use crate::{CommitId, RealmId, Result};
+use crate::{CommitId, RealmId, Result, ScanBatch};
 
 /// A snapshot-isolated read handle. Holds the `BTree` root and allocation
 /// cursor at the time the transaction was opened. Unregisters automatically
@@ -165,6 +165,29 @@ impl<'db, V: Vfs + Clone> ReadTxn<'db, V> {
         self.check_abort()?;
         self.tree()
             .collect_prefix_batch_from(prefix, start, limit)
+            .await
+    }
+
+    /// Scan matching keys in ascending order, with `start` inclusive.
+    ///
+    /// Scanning begins at the greater of `prefix` and `start`.
+    /// `max_bytes` counts each returned key and its complete value.
+    /// The limits exclude vector capacity, allocation overhead, and cached pages.
+    /// Values exceeding either limit remain unread, including overflow chains.
+    /// `limit` identifies a matching record omitted by a budget.
+    /// Record limits take precedence when both budgets exclude that record.
+    /// Zero records returns an empty batch without resolving values.
+    /// Resume with the last returned key followed by `0x00`.
+    pub async fn scan_prefix_from_bounded(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<ScanBatch> {
+        self.check_abort()?;
+        self.tree()
+            .collect_prefix_batch_bounded(prefix, start, max_records, max_bytes)
             .await
     }
 

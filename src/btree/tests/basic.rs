@@ -18,7 +18,7 @@ use crate::{PagedbError, RealmId};
 
 const PAGE: usize = 4096;
 
-async fn fresh_pager() -> Arc<Pager<MemVfs>> {
+pub(super) async fn fresh_pager() -> Arc<Pager<MemVfs>> {
     let mk = derive_mk(&[1u8; 32], &[0u8; 16], 0).unwrap();
     let cfg = PagerConfig {
         page_size: PAGE,
